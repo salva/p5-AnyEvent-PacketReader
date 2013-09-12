@@ -15,6 +15,8 @@ use Errno qw(EPIPE EMSGSIZE EINTR EAGAIN EWOULDBLOCK);
 
 our $MAX_LOAD_LENGTH = 1e6;
 
+our $debug;
+
 my %header_length = ( n => 2,
                       v => 2,
                       N => 4,
@@ -51,11 +53,14 @@ sub packet_reader {
             $header_length or croak "bad header template '$templ'";
         }
     }
-
+    else {
+        $templ = 'N';
+        $header_length = 4;
+    }
 
     # data is:  0:buffer, 1:fh, 2:watcher, 3:header_length, 4:total_length, 5: templ, 6: max_load_length, 7:cb
     my $data = [''      , $fh , undef    , $header_length , undef         , $templ  , $max_load_length  , $cb  ];
-    my $obj = \\$data;
+    my $obj = \$data;
     bless $obj;
     $obj->resume;
     $obj;
@@ -68,14 +73,28 @@ sub pause {
 
 sub resume {
     my $data = ${shift()};
-    if (defined my $fh = $data->[1]) {
+    if (defined(my $fh = $data->[1])) {
         $data->[2] = AE::io $fh, 0, sub { _read($data) };
     }
 }
 
 sub DESTROY {
     my $obj = shift;
+    $debug and warn "PR: watcher is gone, aborting read\n" if ${$obj}->[3];
     @{$$obj} = ();
+}
+
+sub _hexdump {
+    no warnings qw(uninitialized);
+    while ($_[0] =~ /(.{1,32})/smg) {
+        my $line = $1;
+        my @c= (( map { sprintf "%02x",$_ } unpack('C*', $line)),
+                (("  ") x 32))[0..31];
+        $line=~s/(.)/ my $c=$1; unpack("c",$c)>=32 ? $c : '.' /egms;
+        print STDERR "$_[1] ", join(" ", @c, '|', $line), "\n";
+    }
+    print STDERR "\n";
+
 }
 
 sub _read {
@@ -85,19 +104,27 @@ sub _read {
     my $remaining = $length - $offset;
     my $bytes = sysread($data->[1], $data->[0], $remaining, $offset);
     if ($bytes) {
+        $debug and warn "PR: $bytes bytes read";
         if (length $data->[0] == $length) {
             unless (defined $data->[4]) {
                 my $load_length = unpack $data->[5], $data->[0];
+                $debug and warn "PR: reading packet load ($load_length bytes)\n";
                 if ($load_length > $data->[6]) {
+                    $debug and _hexdump($data->[0], 'head:');
                     return _fatal($data, EMSGSIZE)
                 }
-                $data->[4] = $data->[3] + $load_length;
+                if ($load_length) {
+                    $data->[4] = $data->[3] + $load_length;
+                    return;
+                }
+                # else, the packet is done
             }
-            if (defined $data->[4]) {
-                $data->[7]->($data->[0]);
-                # somebody may have taken a reference to the buffer so we start clean:
-                @$data = ('', @$data[1..3], undef, @$data[5..$#$data]);
-            }
+
+            $debug and warn "PR: packet read, invoking callback\n";
+            $data->[7]->($data->[0]);
+            # somebody may have taken a reference to the buffer so we start clean:
+            @$data = ('', @$data[1..3], undef, @$data[5..$#$data]);
+            $debug and warn "PR: waiting for a new packet\n";
         }
     }
     elsif (defined $bytes) {
@@ -112,6 +139,7 @@ sub _read {
 sub _fatal {
     my $data = shift;
     local $! = shift if @_;
+    $debug and warn "PR: fatal error: $!\n";
     $data->[7]->();
     @$data = (); # release watcher;
 }

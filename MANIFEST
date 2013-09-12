@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/AnyEvent-PacketReader.t
+lib/AnyEvent/PacketReader.pm

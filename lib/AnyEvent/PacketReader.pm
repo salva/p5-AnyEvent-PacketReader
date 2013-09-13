@@ -4,6 +4,7 @@ our $VERSION = '0.01';
 
 use strict;
 use warnings;
+use 5.010;
 
 require Exporter;
 our @ISA = qw(Exporter);
@@ -11,9 +12,9 @@ our @EXPORT = qw(packet_reader);
 
 use AnyEvent;
 use Carp;
-use Errno qw(EPIPE EMSGSIZE EINTR EAGAIN EWOULDBLOCK);
+use Errno qw(EPIPE EBADMSG EMSGSIZE EINTR EAGAIN EWOULDBLOCK);
 
-our $MAX_LOAD_LENGTH = 1e6;
+our $MAX_TOTAL_LENGTH = 1e6;
 
 our $debug;
 
@@ -32,25 +33,50 @@ for my $dir (qw(> <)) {
     }
 }
 
+my %load_offset = %header_length;
+my $good_packers = join '', keys %header_length;
+
 sub packet_reader {
     my $cb = pop;
-    my ($fh, $templ, $max_load_length) = @_;
-    croak 'Usage: packet_reader($fh, [$templ, [$max_load_length,]] $callback)'
+    my ($fh, $templ, $max_total_length) = @_;
+    croak 'Usage: packet_reader($fh, [$templ, [$max_total_length,]] $callback)'
         unless defined $fh and defined $cb;
 
-    $max_load_length ||= $MAX_LOAD_LENGTH;
+    $max_total_length ||= $MAX_TOTAL_LENGTH;
     my $header_length;
 
     if (defined $templ) {
         unless ($header_length = $header_length{$templ}) {
-            if (my ($before, $size_templ, $after) = $templ =~ /^(?:x(\d*))(.*?)(?:x(\d*))$/) {
-                if ($header_length = $header_length{$size_templ}) {
-                    $header_length += ($before eq '' ? 1 : $before) if defined $before;
-                    $header_length += ($after  eq '' ? 1 : $after ) if defined $after;
-                    $header_length{$templ} = $header_length;
+            my $load_offset;
+            if ($templ =~ /^(x+)(\d*)/g) {
+                $header_length = length $1 + (length $2 ? $2 - 1 : 0);
+            }
+            elsif ($templ =~ /^\@!(\d*)/g) {
+                $header_length = (length $1 ? $1 : 1);
+            }
+            else {
+                $header_length = 0;
+            }
+
+            $templ =~ /\G([$good_packers][<>]?)/go
+                or croak "bad header template '$templ'";
+
+            $header_length += ($header_length{$1} // die "Internal error: \$header_length{$1} is not defined");
+
+            if ($templ =~ /\G\@!(\d*)/g) {
+                $load_offset =  (length $1 ? $1 : 1);
+            }
+            else {
+                $load_offset = $header_length;
+                if ($templ =~ /\G(x+)(\d*)/g) {
+                    $load_offset += length $1 + (length $2 ? $2 - 1 : 0);
                 }
             }
-            $header_length or croak "bad header template '$templ'";
+
+            $templ =~ /\G$/g or croak "bad header template '$templ'";
+
+            $header_length{$templ} = $header_length;
+            $load_offset{$templ} = $load_offset;
         }
     }
     else {
@@ -58,8 +84,8 @@ sub packet_reader {
         $header_length = 4;
     }
 
-    # data is:  0:buffer, 1:fh, 2:watcher, 3:header_length, 4:total_length, 5: templ, 6: max_load_length, 7:cb
-    my $data = [''      , $fh , undef    , $header_length , undef         , $templ  , $max_load_length  , $cb  ];
+    # data is:  0:buffer, 1:fh, 2:watcher, 3:header_length, 4:total_length, 5: templ, 6: max_total_length, 7:cb
+    my $data = [''      , $fh , undef    , $header_length , undef         , $templ  , $max_total_length  , $cb  ];
     my $obj = \$data;
     bless $obj;
     $obj->resume;
@@ -104,20 +130,32 @@ sub _read {
     my $remaining = $length - $offset;
     my $bytes = sysread($data->[1], $data->[0], $remaining, $offset);
     if ($bytes) {
-        $debug and warn "PR: $bytes bytes read";
+        $debug and warn "PR: $bytes bytes read\n";
         if (length $data->[0] == $length) {
             unless (defined $data->[4]) {
-                my $load_length = unpack $data->[5], $data->[0];
-                $debug and warn "PR: reading packet load ($load_length bytes)\n";
-                if ($load_length > $data->[6]) {
-                    $debug and _hexdump($data->[0], 'head:');
+                my $templ = $data->[5];
+                my $load_length = unpack $templ, $data->[0];
+                unless (defined $load_length) {
+                    $debug and warn "PR: unable to extract size field from header\n";
+                    return _fatal($data, EBADMSG);
+                }
+                my $total_length = $load_offset{$templ} + $load_length;
+                $debug and warn "PR: reading full packet ".
+                    "(load length: $load_length, total: $total_length, current: $length)\n";
+
+                if ($total_length > $data->[6]) {
+                    $debug and warn "PR: received packet is too long\n";
                     return _fatal($data, EMSGSIZE)
                 }
-                if ($load_length) {
-                    $data->[4] = $data->[3] + $load_length;
+                if ($length < $total_length) {
+                    $data->[4] = $total_length;
                     return;
                 }
                 # else, the packet is done
+                if ($length > $total_length) {
+                    $debug and warn "PR: header length ($length) > total length ($total_length)\n";
+                    _fatal($data, EBADMSG);
+                }
             }
 
             $debug and warn "PR: packet read, invoking callback\n";
@@ -128,9 +166,11 @@ sub _read {
         }
     }
     elsif (defined $bytes) {
+        $debug and warn "PR: EOF!\n";
         return _fatal($data, EPIPE);
     }
     else {
+        $debug and warn "PR: sysread failed: $!\n";
         $! == $_ and return for (EINTR, EAGAIN, EWOULDBLOCK);
         return _fatal($data);
     }
@@ -139,7 +179,10 @@ sub _read {
 sub _fatal {
     my $data = shift;
     local $! = shift if @_;
-    $debug and warn "PR: fatal error: $!\n";
+    if ($debug) {
+        warn "PR: fatal error: $!\n";
+        _hexdump($data->[0], 'pkt:');
+    }
     $data->[7]->();
     @$data = (); # release watcher;
 }

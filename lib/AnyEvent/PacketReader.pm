@@ -220,6 +220,10 @@ AnyEvent::PacketReader - Read packets from a socket
 
 =head1 DESCRIPTION
 
+  *********************************************************
+  *** This is a very early release, anything may change ***
+  *********************************************************
+
 This module allows to read packets from a socket easily.
 
 The kind of packets that can be read are those composed by a header
